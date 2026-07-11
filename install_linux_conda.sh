@@ -67,15 +67,15 @@ pip install numpy==1.26.4
 pip install -r requirements.txt
 
 echo "=========================================================="
-echo "[4/6] Installing ONNX Runtime GPU..."
+echo "[4/6] Installing NVIDIA CUDA 12 libraries for GPU acceleration..."
 echo "=========================================================="
-pip uninstall -y onnxruntime
-pip install onnxruntime-gpu
+pip uninstall -y onnxruntime onnxruntime-gpu
+pip install nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cublas-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-cudnn-cu12
 
 echo "=========================================================="
-echo "[5/6] Installing NVIDIA CUDA 12 libraries for GPU acceleration..."
+echo "[5/6] Installing CUDA 12 compatible ONNX Runtime GPU..."
 echo "=========================================================="
-pip install nvidia-cublas-cu12 nvidia-cufft-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 nvidia-cuda-runtime-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cudnn-cu12
+pip install onnxruntime-gpu --extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple
 
 # Set LD_LIBRARY_PATH permanently in conda environment
 NVIDIA_LIB_PATH=$(find $CONDA_PREFIX/lib/python3.12/site-packages/nvidia -name "lib" -type d 2>/dev/null | paste -sd:)
