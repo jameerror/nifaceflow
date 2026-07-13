@@ -504,12 +504,12 @@ class SwapEngine:
             return controls
 
         controls["match_color"] = True
-        controls["swap_blend_strength"] = min(swap_blend_strength, 0.82)
+        controls["swap_blend_strength"] = swap_blend_strength
         if enhance:
             controls["enhance_strength"] = min(enhance_strength, 0.35)
         return controls
 
-    def face_swap(self, source_img, target_img, enhance=True, enhance_strength=0.8, match_color=True, match_scale=False, custom_scale=1.0, det_thresh=0.5, face_upscale_resolution="512", handle_occlusions=True, target_rotation=None, log_callback=None, swap_blend_strength=0.85, match_face_shape=True, pipeline=None, target_faces=None, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
+    def face_swap(self, source_img, target_img, enhance=True, enhance_strength=0.8, match_color=True, match_scale=False, custom_scale=1.0, det_thresh=0.5, face_upscale_resolution="512", handle_occlusions=True, target_rotation=None, log_callback=None, swap_blend_strength=1.0, match_face_shape=True, pipeline=None, target_faces=None, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
         """
         Swaps face from source_img onto target_img with auto-rotation, upscaling, and occlusion handling.
         """
@@ -759,7 +759,7 @@ class SwapEngine:
                     processed_crop = cv2.addWeighted(restored_crop, profile_controls["enhance_strength"], processed_crop, 1.0 - profile_controls["enhance_strength"], 0)
                 
                 # 3. Blend swapped face with original target face to maximize identity similarity
-                if profile_controls["swap_blend_strength"] < 1.0:
+                if abs(profile_controls["swap_blend_strength"] - 1.0) > 1e-5:
                     if target_face_crop_scaled.shape != processed_crop.shape:
                         target_face_crop_scaled = cv2.resize(target_face_crop_scaled, (processed_crop.shape[1], processed_crop.shape[0]), interpolation=cv2.INTER_CUBIC)
                     processed_crop = cv2.addWeighted(processed_crop, profile_controls["swap_blend_strength"], target_face_crop_scaled, 1.0 - profile_controls["swap_blend_strength"], 0)
@@ -945,7 +945,7 @@ class SwapEngine:
             
         return result
 
-    def process_video(self, source_img_path, target_video_path, output_path, enhance=True, enhance_strength=0.8, match_color=True, match_scale=False, custom_scale=1.0, det_thresh=0.5, face_upscale_resolution="512", handle_occlusions=True, frame_step=1, det_size=640, batch_size=1, progress_callback=None, log_callback=None, swap_blend_strength=0.85, match_face_shape=True, selected_gpus=None, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
+    def process_video(self, source_img_path, target_video_path, output_path, enhance=True, enhance_strength=0.8, match_color=True, match_scale=False, custom_scale=1.0, det_thresh=0.5, face_upscale_resolution="512", handle_occlusions=True, frame_step=1, det_size=640, batch_size=1, progress_callback=None, log_callback=None, swap_blend_strength=1.0, match_face_shape=True, selected_gpus=None, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
         import time
         import tempfile
         import shutil

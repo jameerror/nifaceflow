@@ -210,7 +210,7 @@ def calculate_estimated_time(video_path, device_mode):
     
     return f"⏱️ **Estimated Swap Duration ({device_name}):** ~{minutes} min {seconds} sec (at ~{fps_estimate:.1f} frames/sec for {total_frames} frames)"
 
-def preview_selected_frame(source_img_path, video_path, frame_index, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpus, swap_blend_strength=0.85, match_face_shape=True, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
+def preview_selected_frame(source_img_path, video_path, frame_index, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpus, swap_blend_strength=1.0, match_face_shape=True, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
     if not source_img_path or not video_path:
         return None, "[System] Upload both Source Image and Target Video to preview."
         
@@ -273,7 +273,7 @@ def clear_vram_callback():
     msg = engine.unload_models()
     return msg
 
-def perform_image_swap(source_img, target_img, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpu, save_path="", swap_blend_strength=0.85, match_face_shape=True, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
+def perform_image_swap(source_img, target_img, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpu, save_path="", swap_blend_strength=1.0, match_face_shape=True, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
     logs = "[System] Initializing image face swap pipeline...\n"
     yield None, logs
     
@@ -361,7 +361,7 @@ def perform_image_swap(source_img, target_img, enhance, enhance_strength, match_
         logs += f"[Error] Execution failed: {str(e)}\n"
         yield None, logs
 
-def perform_video_swap(source_img, target_video, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpus, frame_step, det_size_val, batch_size, save_path="", swap_blend_strength=0.85, match_face_shape=True, progress=gr.Progress(track_tqdm=False), target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
+def perform_video_swap(source_img, target_video, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpus, frame_step, det_size_val, batch_size, save_path="", swap_blend_strength=1.0, match_face_shape=True, progress=gr.Progress(track_tqdm=False), target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
     import time
     start_swap_time = time.time()
     logs = "[System] Initializing video face swap pipeline...\n"
@@ -821,7 +821,7 @@ with gr.Blocks() as demo:
                         enhance_img = gr.Checkbox(label="Enhance Face Details (GFPGAN Restorer)", value=False)
                         enhance_strength_img = gr.Slider(label="Enhance Strength", minimum=0.0, maximum=1.0, value=0.8, step=0.05)
                         handle_occlusions_img = gr.Checkbox(label="Enable Occlusion Masking (Keep hands/hair/arms in foreground)", value=True)
-                        swap_blend_strength_img = gr.Slider(label="Face Swap Blend Strength (Identity Likeness)", minimum=0.5, maximum=1.0, value=1.0, step=0.05)
+                        swap_blend_strength_img = gr.Slider(label="Face Swap Blend Strength (Identity Likeness)", minimum=0.5, maximum=2.0, value=1.0, step=0.05)
                         match_color_img = gr.Checkbox(label="Match Lighting & Skin Tone (Color Transfer)", value=False)
                         match_face_shape_img = gr.Checkbox(label="Match Face Shape Aspect Ratio (Slim/Wide Jawline to Source)", value=True)
                         match_scale_img = gr.Checkbox(label="Match Source Face Size (Scale to Source)", value=False, visible=False)
@@ -927,7 +927,7 @@ with gr.Blocks() as demo:
                         enhance_vid = gr.Checkbox(label="Enhance Face Details (GFPGAN)", value=False)
                         enhance_strength_vid = gr.Slider(label="Enhance Strength", minimum=0.0, maximum=1.0, value=0.8, step=0.05)
                         handle_occlusions_vid = gr.Checkbox(label="Enable Occlusion Masking (Keep hands/hair/arms in foreground)", value=True)
-                        swap_blend_strength_vid = gr.Slider(label="Face Swap Blend Strength (Identity Likeness)", minimum=0.5, maximum=1.0, value=1.0, step=0.05)
+                        swap_blend_strength_vid = gr.Slider(label="Face Swap Blend Strength (Identity Likeness)", minimum=0.5, maximum=2.0, value=1.0, step=0.05)
                         match_color_vid = gr.Checkbox(label="Match Lighting & Skin Tone (Color Transfer)", value=False)
                         match_face_shape_vid = gr.Checkbox(label="Match Face Shape Aspect Ratio (Slim/Wide Jawline to Source)", value=True)
                         match_scale_vid = gr.Checkbox(label="Match Source Face Size (Scale to Source)", value=False, visible=False)
