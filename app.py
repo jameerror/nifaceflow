@@ -798,7 +798,7 @@ with gr.Blocks() as demo:
                         swapper_model_img = gr.Dropdown(choices=available_swappers, value=default_swapper, label="Face Swapper Model")
                         restorer_model_img = gr.Dropdown(choices=available_restorers, value=default_restorer, label="Face Restorer (Enhancer) Model")
                         target_detector_img = gr.Dropdown(choices=["SCRFD (Default)", "YOLOv11-Face"], value="SCRFD (Default)", label="Target Face Detector Model")
-                        face_mask_type_img = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)"], value="MediaPipe FaceMesh (468-Point)", label="Face Masking/Blending Method")
+                        face_mask_type_img = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"], value="MediaPipe FaceMesh 3D Pose (Best)", label="Face Masking/Blending Method")
                     
                     with gr.Group():
                         gr.Markdown("⚙️ **Hardware Device**")
@@ -898,7 +898,7 @@ with gr.Blocks() as demo:
                         swapper_model_vid = gr.Dropdown(choices=available_swappers, value=default_swapper, label="Face Swapper Model")
                         restorer_model_vid = gr.Dropdown(choices=available_restorers, value=default_restorer, label="Face Restorer (Enhancer) Model")
                         target_detector_vid = gr.Dropdown(choices=["SCRFD (Default)", "YOLOv11-Face"], value="SCRFD (Default)", label="Target Face Detector Model")
-                        face_mask_type_vid = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)"], value="MediaPipe FaceMesh (468-Point)", label="Face Masking/Blending Method")
+                        face_mask_type_vid = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"], value="MediaPipe FaceMesh 3D Pose (Best)", label="Face Masking/Blending Method")
                     
                     with gr.Group():
                         gr.Markdown("⚙️ **Hardware Device**")

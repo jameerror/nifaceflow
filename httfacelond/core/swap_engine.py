@@ -285,6 +285,147 @@ class SwapEngine:
         soft_mask = soft_mask * soft_mask * (3.0 - 2.0 * soft_mask)
         return np.expand_dims(soft_mask, axis=2)
 
+    def _analyze_face_mesh_3d(self, target_img, face, image_size=256):
+        """
+        Uses MediaPipe FaceMesh as a lightweight 3D face model.
+        Returns mesh points warped back to target coordinates plus an approximate head pose.
+        """
+        try:
+            import mediapipe as mp
+
+            aligned_img, _ = insightface.utils.face_align.norm_crop2(target_img, face.kps, image_size)
+            rgb_crop = cv2.cvtColor(aligned_img, cv2.COLOR_BGR2RGB)
+            mp_face_mesh = mp.solutions.face_mesh
+
+            with mp_face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.25,
+            ) as face_mesh:
+                results = face_mesh.process(rgb_crop)
+
+            if not results.multi_face_landmarks:
+                return None
+
+            landmarks = results.multi_face_landmarks[0].landmark
+            mesh_pts_aligned = np.array(
+                [[lm.x * image_size, lm.y * image_size] for lm in landmarks],
+                dtype=np.float32,
+            )
+
+            M_mesh = insightface.utils.face_align.estimate_norm(face.kps, image_size)
+            IM_mesh = cv2.invertAffineTransform(M_mesh)
+            mesh_pts_target = cv2.transform(mesh_pts_aligned[np.newaxis], IM_mesh)[0]
+
+            pose = self._estimate_mesh_head_pose(mesh_pts_target, target_img.shape[:2])
+            return {
+                "points_target": mesh_pts_target,
+                "pose": pose,
+                "point_count": len(mesh_pts_target),
+            }
+        except Exception:
+            return None
+
+    def _estimate_mesh_head_pose(self, mesh_pts, image_shape):
+        """
+        Estimates yaw/pitch/roll from stable MediaPipe mesh indices.
+        The angles are approximate, but good enough to detect profile turns and tune blending.
+        """
+        required = [1, 152, 33, 263, 61, 291]
+        if mesh_pts is None or len(mesh_pts) <= max(required):
+            return None
+
+        image_points = np.array([
+            mesh_pts[1],    # nose tip
+            mesh_pts[152],  # chin
+            mesh_pts[33],   # left eye outer corner
+            mesh_pts[263],  # right eye outer corner
+            mesh_pts[61],   # left mouth corner
+            mesh_pts[291],  # right mouth corner
+        ], dtype=np.float64)
+
+        model_points = np.array([
+            [0.0, 0.0, 0.0],
+            [0.0, -63.6, -12.5],
+            [-43.3, 32.7, -26.0],
+            [43.3, 32.7, -26.0],
+            [-28.9, -28.9, -24.1],
+            [28.9, -28.9, -24.1],
+        ], dtype=np.float64)
+
+        h, w = image_shape
+        focal_length = float(w)
+        camera_matrix = np.array([
+            [focal_length, 0.0, w / 2.0],
+            [0.0, focal_length, h / 2.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+        dist_coeffs = np.zeros((4, 1), dtype=np.float64)
+
+        ok, rotation_vec, translation_vec = cv2.solvePnP(
+            model_points,
+            image_points,
+            camera_matrix,
+            dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
+        )
+        if not ok:
+            return None
+
+        rotation_mat, _ = cv2.Rodrigues(rotation_vec)
+        projection_mat = np.hstack((rotation_mat, translation_vec))
+        _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(projection_mat)
+        return {
+            "pitch": float(euler[0][0]),
+            "yaw": float(euler[1][0]),
+            "roll": float(euler[2][0]),
+        }
+
+    def _mesh_pose_note(self, mesh_analysis):
+        pose = mesh_analysis.get("pose") if mesh_analysis else None
+        if not pose:
+            return None
+
+        yaw = abs(pose.get("yaw", 0.0))
+        pitch = abs(pose.get("pitch", 0.0))
+        roll = abs(pose.get("roll", 0.0))
+        if yaw >= 35.0:
+            return f"3D profile pose yaw={pose['yaw']:.1f}"
+        if pitch >= 30.0:
+            return f"3D tilted pose pitch={pose['pitch']:.1f}"
+        if roll >= 35.0:
+            return f"3D rotated pose roll={pose['roll']:.1f}"
+        return None
+
+    def _build_mesh_mask(self, mask, mesh_analysis, x1, y1, log, face_index):
+        mesh_pts_target = mesh_analysis.get("points_target") if mesh_analysis else None
+        if mesh_pts_target is None or len(mesh_pts_target) < 64:
+            return False
+
+        mesh_pts_local = mesh_pts_target.copy()
+        mesh_pts_local[:, 0] -= x1
+        mesh_pts_local[:, 1] -= y1
+
+        # Add a small forehead extension from the mesh bounds so brows do not create a hard cut.
+        mx1 = float(np.min(mesh_pts_local[:, 0]))
+        mx2 = float(np.max(mesh_pts_local[:, 0]))
+        my1 = float(np.min(mesh_pts_local[:, 1]))
+        my2 = float(np.max(mesh_pts_local[:, 1]))
+        mh = max(my2 - my1, 1.0)
+        forehead_y = max(0.0, my1 - 0.18 * mh)
+        forehead_pts = np.array([
+            [mx1, forehead_y],
+            [(mx1 + mx2) * 0.5, forehead_y],
+            [mx2, forehead_y],
+        ], dtype=np.float32)
+
+        hull_pts = np.vstack([mesh_pts_local, forehead_pts])
+        hull = cv2.convexHull(hull_pts.astype(np.int32))
+        cv2.fillConvexPoly(mask, hull, 255)
+        log(f"[Face {face_index}] Generating MediaPipe 3D FaceMesh mask ({mesh_analysis.get('point_count', 0)} points).")
+        return True
+
     def _estimate_kps_from_bbox(self, bbox):
         x1, y1, x2, y2 = np.asarray(bbox, dtype=np.float32)
         bw = max(float(x2 - x1), 1.0)
@@ -501,6 +642,14 @@ class SwapEngine:
             if not can_align:
                 log(f"[Face {idx+1}] Cannot swap face: {alignment_note}.")
                 continue
+
+            mesh_analysis = None
+            if face_mask_type in ("MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"):
+                mesh_analysis = self._analyze_face_mesh_3d(target_oriented, face)
+                mesh_note = self._mesh_pose_note(mesh_analysis)
+                if mesh_note:
+                    alignment_note = mesh_note if alignment_note is None else f"{alignment_note}; {mesh_note}"
+
             profile_controls = self._profile_swap_controls(alignment_note, enhance, enhance_strength, swap_blend_strength, match_color)
             if alignment_note:
                 log(f"[Face {idx+1}] Forcing difficult-angle swap: {alignment_note}.")
@@ -631,46 +780,13 @@ class SwapEngine:
                 # Generate dynamic landmark convex hull mask for target face
                 mask = np.zeros(swapped_face_crop.shape[:2], dtype=np.float32)
                 
-                # Option A: Google MediaPipe FaceMesh (468 points)
-                if face_mask_type == "MediaPipe FaceMesh (468-Point)":
+                # Option A: Google MediaPipe FaceMesh / 3D Pose mask
+                if face_mask_type in ("MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"):
                     try:
-                        import mediapipe as mp
-                        mp_face_mesh = mp.solutions.face_mesh
-                        # Use aligned face crop for reliable detection (same approach as V2)
-                        # Generate a clean aligned crop at a good resolution for MediaPipe
-                        aimg_for_mesh, _ = insightface.utils.face_align.norm_crop2(target_oriented, face.kps, 256)
-                        with mp_face_mesh.FaceMesh(
-                            static_image_mode=True,
-                            max_num_faces=1,
-                            refine_landmarks=False,
-                            min_detection_confidence=0.3
-                        ) as face_mesh:
-                            rgb_crop = cv2.cvtColor(aimg_for_mesh, cv2.COLOR_BGR2RGB)
-                            results_mesh = face_mesh.process(rgb_crop)
-                            if results_mesh.multi_face_landmarks:
-                                log(f"[Face {idx+1}] Generating Google MediaPipe 468-point face mesh mask...")
-                                # Get the alignment matrix used for the crop
-                                M_mesh = insightface.utils.face_align.estimate_norm(face.kps, 256)
-                                IM_mesh = cv2.invertAffineTransform(M_mesh)
-                                
-                                # Convert mesh landmarks back to target image coordinates
-                                mesh_pts_aligned = []
-                                for lm in results_mesh.multi_face_landmarks[0].landmark:
-                                    mesh_pts_aligned.append([lm.x * 256, lm.y * 256])
-                                mesh_pts_aligned = np.array(mesh_pts_aligned, dtype=np.float32)
-                                
-                                # Warp back to target image coordinates
-                                mesh_pts_target = cv2.transform(mesh_pts_aligned[np.newaxis], IM_mesh)[0]
-                                
-                                # Offset to local bounding box crop coordinates
-                                mesh_pts_local = mesh_pts_target.copy()
-                                mesh_pts_local[:, 0] -= x1
-                                mesh_pts_local[:, 1] -= y1
-                                
-                                hull = cv2.convexHull(mesh_pts_local.astype(np.int32))
-                                cv2.fillConvexPoly(mask, hull, 255)
-                            else:
-                                raise ValueError("No mesh detected in local crop")
+                        if mesh_analysis is None:
+                            mesh_analysis = self._analyze_face_mesh_3d(target_oriented, face)
+                        if not self._build_mesh_mask(mask, mesh_analysis, x1, y1, log, idx + 1):
+                            raise ValueError("No mesh detected in local crop")
                     except Exception as e:
                         log(f"[Warning] MediaPipe FaceMesh failed: {e}. Falling back to 106-point landmark mask...")
                         face_mask_type = "InsightFace 106-Point"
