@@ -153,6 +153,8 @@ ort.InferenceSession.__init__ = patched_init
 import tempfile
 from httfacelond.utils.downloader import check_and_download_models
 
+_HEAD3D_RENDER_CACHE = {}
+
 # Ensure models are downloaded before importing SwapEngine
 print("[Info] Checking models...")
 check_and_download_models()
@@ -574,6 +576,185 @@ def _overlay_rgba(frame, overlay, center_x, center_y):
     frame[by1:by2, bx1:bx2] = np.clip(rgb * alpha + base * (1.0 - alpha), 0, 255).astype(np.uint8)
     return frame
 
+def _read_glb_chunks(model_path):
+    import json
+    import struct
+
+    with open(model_path, "rb") as f:
+        data = f.read()
+    if len(data) < 20 or data[:4] != b"glTF":
+        raise ValueError("Not a valid GLB file")
+
+    offset = 12
+    json_chunk = None
+    bin_chunk = None
+    while offset + 8 <= len(data):
+        chunk_len, chunk_type = struct.unpack_from("<II", data, offset)
+        offset += 8
+        chunk = data[offset:offset + chunk_len]
+        offset += chunk_len
+        if chunk_type == 0x4E4F534A:
+            json_chunk = json.loads(chunk.decode("utf-8"))
+        elif chunk_type == 0x004E4942:
+            bin_chunk = chunk
+
+    if json_chunk is None or bin_chunk is None:
+        raise ValueError("GLB must contain JSON and BIN chunks")
+    return json_chunk, bin_chunk
+
+def _accessor_array(gltf, bin_chunk, accessor_index):
+    import numpy as _np
+
+    accessor = gltf["accessors"][accessor_index]
+    view = gltf["bufferViews"][accessor["bufferView"]]
+    comp_type = accessor["componentType"]
+    dtype_map = {
+        5120: _np.int8,
+        5121: _np.uint8,
+        5122: _np.int16,
+        5123: _np.uint16,
+        5125: _np.uint32,
+        5126: _np.float32,
+    }
+    comp_count_map = {
+        "SCALAR": 1,
+        "VEC2": 2,
+        "VEC3": 3,
+        "VEC4": 4,
+        "MAT4": 16,
+    }
+    dtype = dtype_map[comp_type]
+    comp_count = comp_count_map[accessor["type"]]
+    count = accessor["count"]
+    byte_offset = view.get("byteOffset", 0) + accessor.get("byteOffset", 0)
+    byte_stride = view.get("byteStride")
+    item_size = _np.dtype(dtype).itemsize * comp_count
+
+    raw = memoryview(bin_chunk)[byte_offset:byte_offset + view["byteLength"]]
+    if byte_stride and byte_stride != item_size:
+        rows = []
+        for i in range(count):
+            start = i * byte_stride
+            rows.append(_np.frombuffer(raw[start:start + item_size], dtype=dtype, count=comp_count))
+        arr = _np.vstack(rows)
+    else:
+        arr = _np.frombuffer(raw[:count * item_size], dtype=dtype, count=count * comp_count).reshape((count, comp_count))
+    return arr.copy()
+
+def _node_matrix(node):
+    if "matrix" in node:
+        return np.array(node["matrix"], dtype=np.float32).reshape(4, 4).T
+
+    t = np.array(node.get("translation", [0.0, 0.0, 0.0]), dtype=np.float32)
+    s = np.array(node.get("scale", [1.0, 1.0, 1.0]), dtype=np.float32)
+    q = np.array(node.get("rotation", [0.0, 0.0, 0.0, 1.0]), dtype=np.float32)
+    x, y, z, w = q
+    rot = np.array([
+        [1 - 2 * y * y - 2 * z * z, 2 * x * y - 2 * z * w, 2 * x * z + 2 * y * w, 0],
+        [2 * x * y + 2 * z * w, 1 - 2 * x * x - 2 * z * z, 2 * y * z - 2 * x * w, 0],
+        [2 * x * z - 2 * y * w, 2 * y * z + 2 * x * w, 1 - 2 * x * x - 2 * y * y, 0],
+        [0, 0, 0, 1],
+    ], dtype=np.float32)
+    mat = np.eye(4, dtype=np.float32)
+    mat[:3, :3] = rot[:3, :3] * s.reshape(1, 3)
+    mat[:3, 3] = t
+    return mat
+
+def _collect_glb_triangles(model_path):
+    gltf, bin_chunk = _read_glb_chunks(model_path)
+    nodes = gltf.get("nodes", [])
+    scene_index = gltf.get("scene", 0)
+    scene_nodes = gltf.get("scenes", [{}])[scene_index].get("nodes", list(range(len(nodes))))
+    triangles = []
+
+    def material_color(material_index):
+        if material_index is None:
+            return np.array([190, 160, 135], dtype=np.float32)
+        material = gltf.get("materials", [{}])[material_index]
+        pbr = material.get("pbrMetallicRoughness", {})
+        color = np.array(pbr.get("baseColorFactor", [0.75, 0.62, 0.52, 1.0])[:3], dtype=np.float32)
+        return np.clip(color * 255.0, 0, 255)
+
+    def walk(node_index, parent_mat):
+        node = nodes[node_index]
+        mat = parent_mat @ _node_matrix(node)
+        if "mesh" in node:
+            mesh = gltf["meshes"][node["mesh"]]
+            for primitive in mesh.get("primitives", []):
+                attrs = primitive.get("attributes", {})
+                if "POSITION" not in attrs:
+                    continue
+                pos = _accessor_array(gltf, bin_chunk, attrs["POSITION"]).astype(np.float32)
+                pos_h = np.hstack([pos, np.ones((pos.shape[0], 1), dtype=np.float32)])
+                pos = (pos_h @ mat.T)[:, :3]
+
+                indices = primitive.get("indices")
+                if indices is not None:
+                    idx = _accessor_array(gltf, bin_chunk, indices).reshape(-1).astype(np.int64)
+                else:
+                    idx = np.arange(pos.shape[0], dtype=np.int64)
+
+                color = material_color(primitive.get("material"))
+                for i in range(0, len(idx) - 2, 3):
+                    tri = pos[idx[i:i + 3]]
+                    if tri.shape == (3, 3):
+                        triangles.append((tri, color))
+        for child in node.get("children", []):
+            walk(child, mat)
+
+    for root in scene_nodes:
+        walk(root, np.eye(4, dtype=np.float32))
+    if not triangles:
+        raise ValueError("No triangles found in GLB")
+    return triangles
+
+def _render_model_rgba(model_path, width, height):
+    cache_key = (model_path, int(width), int(height), os.path.getmtime(model_path))
+    if cache_key in _HEAD3D_RENDER_CACHE:
+        return _HEAD3D_RENDER_CACHE[cache_key].copy()
+
+    ext = os.path.splitext(model_path)[1].lower()
+    if ext != ".glb":
+        return _make_proxy_head_rgba(width, height)
+
+    triangles = _collect_glb_triangles(model_path)
+    all_pts = np.vstack([tri for tri, _ in triangles])
+    center = (all_pts.min(axis=0) + all_pts.max(axis=0)) * 0.5
+    span = np.maximum(all_pts.max(axis=0) - all_pts.min(axis=0), 1e-6)
+    scale = 0.82 * min(width / span[0], height / max(span[1], span[2], 1e-6))
+
+    canvas = np.zeros((height, width, 4), dtype=np.uint8)
+    light = np.array([-0.25, -0.55, 1.0], dtype=np.float32)
+    light /= np.linalg.norm(light)
+    projected = []
+
+    for tri, color in triangles:
+        pts = (tri - center) * scale
+        x = pts[:, 0] + width * 0.5
+        y = -pts[:, 1] + height * 0.52
+        z = pts[:, 2]
+        p2 = np.stack([x, y], axis=1).astype(np.int32)
+        normal = np.cross(pts[1] - pts[0], pts[2] - pts[0])
+        norm = np.linalg.norm(normal)
+        if norm < 1e-6:
+            continue
+        normal = normal / norm
+        shade = 0.42 + 0.58 * max(0.0, float(np.dot(normal, light)))
+        projected.append((float(np.mean(z)), p2, np.clip(color * shade, 0, 255).astype(np.uint8)))
+
+    for _, p2, color in sorted(projected, key=lambda item: item[0]):
+        if np.max(p2[:, 0]) < 0 or np.min(p2[:, 0]) >= width or np.max(p2[:, 1]) < 0 or np.min(p2[:, 1]) >= height:
+            continue
+        cv2.fillConvexPoly(canvas, p2, (int(color[0]), int(color[1]), int(color[2]), 245))
+
+    alpha = canvas[:, :, 3]
+    if np.count_nonzero(alpha) == 0:
+        return _make_proxy_head_rgba(width, height)
+    alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
+    canvas[:, :, 3] = alpha
+    _HEAD3D_RENDER_CACHE[cache_key] = canvas.copy()
+    return canvas
+
 def _detect_head_anchor(frame, anchor_mode, head_scale, vertical_offset, pose_result=None):
     height, width = frame.shape[:2]
     if pose_result is not None and pose_result.pose_landmarks:
@@ -606,12 +787,16 @@ def _detect_head_anchor(frame, anchor_mode, head_scale, vertical_offset, pose_re
         return np.array([width * 0.5, height * (0.38 + vertical_offset * 0.15), head_h * 0.78, head_h], dtype=np.float32)
     return None
 
-def _apply_proxy_head(frame, anchor):
+def _apply_proxy_head(frame, anchor, model_path=None):
     if anchor is None:
         return frame
     ow = max(24, int(anchor[2]))
     oh = max(32, int(anchor[3]))
-    head_rgba = _make_proxy_head_rgba(ow, oh)
+    try:
+        head_rgba = _render_model_rgba(model_path, ow, oh) if model_path else _make_proxy_head_rgba(ow, oh)
+    except Exception as e:
+        print(f"[3D Head] GLB software render failed, using proxy head: {e}")
+        head_rgba = _make_proxy_head_rgba(ow, oh)
     return _overlay_rgba(frame, head_rgba, anchor[0], anchor[1])
 
 def perform_3d_head_image_composite(head_model, target_image, anchor_mode, render_backend, head_scale, vertical_offset):
@@ -643,10 +828,10 @@ def perform_3d_head_image_composite(head_model, target_image, anchor_mode, rende
         if anchor is None:
             return None, logs + "[Error] Could not detect neck/shoulders. Try Manual Center Anchor.\n"
 
-        frame = _apply_proxy_head(frame, anchor)
+        frame = _apply_proxy_head(frame, anchor, model_path=model_path)
         logs += f"[3D Head Image] Model: {model_path}\n"
         logs += f"[3D Head Image] Anchor mode: {anchor_mode}\n"
-        logs += "[3D Head Image] CPU Preview rendered a tracked proxy head on the image.\n"
+        logs += "[3D Head Image] CPU Preview rendered the uploaded model when GLB software rendering is available.\n"
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), logs
     except Exception as e:
         import traceback
@@ -726,7 +911,7 @@ def perform_3d_head_composite(head_model, target_video, anchor_mode, render_back
                     last_anchor = anchor if last_anchor is None else (0.28 * anchor + 0.72 * last_anchor)
 
                 if last_anchor is not None:
-                    frame = _apply_proxy_head(frame, last_anchor)
+                    frame = _apply_proxy_head(frame, last_anchor, model_path=model_path)
 
                 writer.write(frame)
                 processed += 1
@@ -753,7 +938,7 @@ def perform_3d_head_composite(head_model, target_video, anchor_mode, render_back
 
         logs += f"[3D Head] Processed {processed}/{total_frames or processed} frames.\n"
         logs += f"[3D Head] Pose anchors detected on {detected} frames.\n"
-        logs += "[3D Head] CPU Preview rendered a tracked proxy head. Full 3D model rendering is the next backend step.\n"
+        logs += "[3D Head] CPU Preview rendered the uploaded model when GLB software rendering is available.\n"
         logs += f"[3D Head] Output saved to: {os.path.abspath(dest)}\n"
         shutil.rmtree(temp_dir, ignore_errors=True)
         return dest, logs
