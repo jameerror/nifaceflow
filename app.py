@@ -1,5 +1,7 @@
 import os
 import sys
+import datetime
+import zipfile
 
 # Force ONNX Runtime and cuDNN to disable the buggy cuDNN Frontend graph engine
 # This completely prevents CUDNN_BACKEND_API_FAILED crashes on long video runs on Ada/Hopper architectures.
@@ -78,6 +80,7 @@ gradio_client.utils.get_type = patched_get_type
 import gradio as gr
 import cv2
 import onnxruntime as ort
+import numpy as np
 
 orig_init = ort.InferenceSession.__init__
 def patched_init(self, model_path, sess_options=None, *args, **kwargs):
@@ -273,6 +276,97 @@ def clear_vram_callback():
     msg = engine.unload_models()
     return msg
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+
+def _uploaded_file_path(uploaded_file):
+    if isinstance(uploaded_file, os.PathLike):
+        return os.fspath(uploaded_file)
+    if isinstance(uploaded_file, str):
+        return uploaded_file
+    if isinstance(uploaded_file, (list, tuple)) and uploaded_file:
+        return _uploaded_file_path(uploaded_file[0])
+    if hasattr(uploaded_file, "path"):
+        return uploaded_file.path
+    if hasattr(uploaded_file, "name"):
+        return uploaded_file.name
+    if isinstance(uploaded_file, dict):
+        return uploaded_file.get("path") or uploaded_file.get("name")
+    return None
+
+def _read_image_bgr(path):
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        if data.size:
+            return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except Exception:
+        pass
+    return cv2.imread(path)
+
+def _write_image(path, image):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    ext = os.path.splitext(path)[1] or ".jpg"
+    ok, encoded = cv2.imencode(ext, image)
+    if not ok:
+        return False
+    encoded.tofile(path)
+    return True
+
+def _collect_image_uploads(uploaded_files, folder_path=""):
+    paths = []
+
+    folder_path = folder_path.strip() if folder_path else ""
+    if folder_path:
+        if os.path.isdir(folder_path):
+            for root, _, files in os.walk(folder_path):
+                for filename in files:
+                    path = os.path.join(root, filename)
+                    ext = os.path.splitext(path)[1].lower()
+                    if ext in IMAGE_EXTENSIONS:
+                        paths.append(path)
+        elif os.path.isfile(folder_path):
+            ext = os.path.splitext(folder_path)[1].lower()
+            if ext in IMAGE_EXTENSIONS:
+                paths.append(folder_path)
+
+    if not uploaded_files:
+        return sorted(set(paths), key=lambda p: os.path.basename(p).lower())
+
+    if not isinstance(uploaded_files, (list, tuple)):
+        uploaded_files = [uploaded_files]
+    for uploaded_file in uploaded_files:
+        path = _uploaded_file_path(uploaded_file)
+        if not path:
+            continue
+        if os.path.isdir(path):
+            for root, _, files in os.walk(path):
+                for filename in files:
+                    nested_path = os.path.join(root, filename)
+                    ext = os.path.splitext(nested_path)[1].lower()
+                    if ext in IMAGE_EXTENSIONS:
+                        paths.append(nested_path)
+            continue
+        ext = os.path.splitext(path)[1].lower()
+        if ext in IMAGE_EXTENSIONS:
+            paths.append(path)
+    return sorted(set(paths), key=lambda p: os.path.basename(p).lower())
+
+def _batch_output_dir(save_path):
+    dest = save_path.strip() if save_path and save_path.strip() else ""
+    if dest:
+        root, ext = os.path.splitext(dest)
+        if ext.lower() in IMAGE_EXTENSIONS or ext.lower() == ".zip":
+            parent = os.path.dirname(dest) or "output"
+            folder = os.path.basename(root) or "batch_images"
+            return os.path.join(parent, f"{folder}_batch")
+        return dest
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join("output", f"batch_images_{timestamp}")
+
+def _result_filename(input_path, index):
+    base = os.path.splitext(os.path.basename(input_path))[0].strip() or f"image_{index:04d}"
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in base)
+    return f"{index:04d}_{safe}_swapped.jpg"
+
 def perform_image_swap(source_img, target_img, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpu, save_path="", swap_blend_strength=1.0, match_face_shape=True, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
     logs = "[System] Initializing image face swap pipeline...\n"
     yield None, logs
@@ -360,6 +454,104 @@ def perform_image_swap(source_img, target_img, enhance, enhance_strength, match_
         traceback.print_exc()
         logs += f"[Error] Execution failed: {str(e)}\n"
         yield None, logs
+
+def perform_batch_image_swap(source_img, target_files, target_folder_path, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpu, save_path="", swap_blend_strength=1.0, match_face_shape=True, target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
+    logs = "[System] Initializing batch image face swap pipeline...\n"
+    yield [], None, logs
+
+    target_paths = _collect_image_uploads(target_files, target_folder_path)
+    if source_img is None or not target_paths:
+        logs += "[Error] Missing source image or target image folder/files. Upload a folder, select images, or paste a local folder path.\n"
+        yield [], None, logs
+        return
+
+    active_engine = engine
+
+    if device_mode == "GPU Mode" and selected_gpu:
+        execution_device = selected_gpu
+    else:
+        execution_device = "CPU Only"
+
+    logs += f"[Hardware] Selecting processing device: {execution_device}...\n"
+    logs += f"[Batch] Found {len(target_paths)} image(s) to process.\n"
+    yield [], None, logs
+    active_engine.set_execution_provider(execution_device)
+
+    logs += f"[Model] Selected Swapper: {swapper_model}\n"
+    logs += f"[Model] Selected Restorer: {restorer_model}\n"
+    yield [], None, logs
+    active_engine.load_swapper(swapper_model)
+    active_engine.load_restorer(restorer_model)
+
+    src_cv = cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR)
+    output_dir = _batch_output_dir(save_path)
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved_paths = []
+    failed = []
+
+    for index, target_path in enumerate(target_paths, start=1):
+        logs += f"[Batch] ({index}/{len(target_paths)}) Processing: {os.path.basename(target_path)}\n"
+        yield saved_paths, None, logs
+
+        tgt_cv = _read_image_bgr(target_path)
+        if tgt_cv is None:
+            failed.append((target_path, "Could not read image"))
+            logs += f"[Warning] Skipped unreadable image: {target_path}\n"
+            continue
+
+        item_logs = []
+        def log_callback(msg):
+            item_logs.append(msg)
+
+        try:
+            result_cv = active_engine.face_swap(
+                src_cv,
+                tgt_cv,
+                enhance=enhance,
+                enhance_strength=enhance_strength,
+                match_color=match_color,
+                match_scale=match_scale,
+                custom_scale=custom_scale,
+                det_thresh=det_thresh,
+                face_upscale_resolution=face_upscale_resolution,
+                handle_occlusions=handle_occlusions,
+                log_callback=log_callback,
+                swap_blend_strength=swap_blend_strength,
+                match_face_shape=match_face_shape,
+                target_detector=target_detector,
+                face_mask_type=face_mask_type
+            )
+
+            dest = os.path.join(output_dir, _result_filename(target_path, index))
+            if _write_image(dest, result_cv):
+                saved_paths.append(os.path.abspath(dest))
+                logs += f"[Batch] Saved: {os.path.abspath(dest)}\n"
+            else:
+                failed.append((target_path, "Could not encode output image"))
+                logs += f"[Warning] Could not save output for: {target_path}\n"
+        except Exception as e:
+            failed.append((target_path, str(e)))
+            logs += f"[Error] Failed: {os.path.basename(target_path)} -> {str(e)}\n"
+
+    zip_path = None
+    if saved_paths:
+        zip_path = os.path.abspath(os.path.join(output_dir, "swapped_batch_results.zip"))
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+            for path in saved_paths:
+                zip_file.write(path, arcname=os.path.basename(path))
+        logs += f"[System] Batch output folder: {os.path.abspath(output_dir)}\n"
+        logs += f"[System] Zip package created: {zip_path}\n"
+
+    logs += f"[System] Batch completed. Success: {len(saved_paths)}, Failed: {len(failed)}.\n"
+    if failed:
+        logs += "[System] Failed files:\n"
+        for path, reason in failed[:20]:
+            logs += f"  - {os.path.basename(path)}: {reason}\n"
+        if len(failed) > 20:
+            logs += f"  - ...and {len(failed) - 20} more.\n"
+
+    yield saved_paths, zip_path, logs
 
 def perform_video_swap(source_img, target_video, enhance, enhance_strength, match_color, match_scale, custom_scale, det_thresh, face_upscale_resolution, handle_occlusions, swapper_model, restorer_model, device_mode, selected_gpus, frame_step, det_size_val, batch_size, save_path="", swap_blend_strength=1.0, match_face_shape=True, progress=gr.Progress(track_tqdm=False), target_detector="SCRFD (Default)", face_mask_type="InsightFace 106-Point"):
     import time
@@ -781,13 +973,22 @@ with gr.Blocks() as demo:
                     gr.Markdown("### 1. Upload Images")
                     source_image = gr.Image(type="numpy", label="Source Face (Will be taken from this image)", height=280)
                     target_image = gr.Image(type="numpy", label="Target Image (Where the face will be placed)", height=280)
+                    batch_target_images = gr.File(
+                        label="Batch Target Images / Folder Upload",
+                        file_count="directory",
+                        type="filepath"
+                    )
+                    batch_target_folder_path = gr.Textbox(label="Batch Target Local Folder Path (Optional)", placeholder="e.g. C:\\Users\\fds\\Pictures\\targets", value="")
                 
                 # Column 2: Swapped Result & Controls
                 with gr.Column(scale=1):
                     gr.Markdown("### 2. Output & Swap Action")
                     output_image = gr.Image(type="numpy", label="Swapped Result", height=280)
+                    batch_output_gallery = gr.Gallery(label="Batch Results", columns=3, height=280, show_label=True)
+                    batch_output_zip = gr.File(label="Batch Results Zip")
                     btn_swap_img = gr.Button("🚀 Start Face Swap", variant="primary")
                     btn_clear_vram_img = gr.Button("🧹 Clear VRAM Memory", variant="secondary")
+                    btn_batch_swap_img = gr.Button("Start Batch Folder Swap", variant="secondary")
                     image_status = gr.Textbox(label="System Process Logs", interactive=False, lines=8, max_lines=12, elem_classes="log-box")
                     
                 # Column 3: Settings & Models
@@ -799,7 +1000,7 @@ with gr.Blocks() as demo:
                         swapper_model_img = gr.Dropdown(choices=available_swappers, value=default_swapper, label="Face Swapper Model")
                         restorer_model_img = gr.Dropdown(choices=available_restorers, value=default_restorer, label="Face Restorer (Enhancer) Model")
                         target_detector_img = gr.Dropdown(choices=["SCRFD (Default)", "YOLOv11-Face"], value="SCRFD (Default)", label="Target Face Detector Model")
-                        face_mask_type_img = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"], value="MediaPipe FaceMesh 3D Pose (Best)", label="Face Masking/Blending Method")
+                        face_mask_type_img = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)"], value="MediaPipe FaceMesh (468-Point)", label="Face Masking/Blending Method")
                     
                     with gr.Group():
                         gr.Markdown("⚙️ **Hardware Device**")
@@ -815,7 +1016,7 @@ with gr.Blocks() as demo:
                         outputs=[gpu_choice_img]
                     )
                     
-                    custom_save_path_img = gr.Textbox(label="Save Output Image to Path (Optional)", placeholder="e.g. outputs/result.png", value="")
+                    custom_save_path_img = gr.Textbox(label="Save Output Path / Batch Folder (Optional)", placeholder="single: outputs/result.png | batch: outputs/batch_folder", value="")
                     
                     # Collapsible Accordion for Advanced Parameters
                     with gr.Accordion("🔧 Advanced Settings & Realism Parameters", open=False):
@@ -839,6 +1040,17 @@ with gr.Blocks() as demo:
                     custom_save_path_img, swap_blend_strength_img, match_face_shape_img, target_detector_img, face_mask_type_img
                 ],
                 outputs=[output_image, image_status]
+            )
+
+            btn_batch_swap_img.click(
+                fn=perform_batch_image_swap,
+                inputs=[
+                    source_image, batch_target_images, batch_target_folder_path,
+                    enhance_img, enhance_strength_img, match_color_img, match_scale_img, custom_scale_img, det_thresh_img, face_upscale_res_img, handle_occlusions_img,
+                    swapper_model_img, restorer_model_img, device_mode_img, gpu_choice_img,
+                    custom_save_path_img, swap_blend_strength_img, match_face_shape_img, target_detector_img, face_mask_type_img
+                ],
+                outputs=[batch_output_gallery, batch_output_zip, image_status]
             )
             
             btn_clear_vram_img.click(
@@ -899,7 +1111,7 @@ with gr.Blocks() as demo:
                         swapper_model_vid = gr.Dropdown(choices=available_swappers, value=default_swapper, label="Face Swapper Model")
                         restorer_model_vid = gr.Dropdown(choices=available_restorers, value=default_restorer, label="Face Restorer (Enhancer) Model")
                         target_detector_vid = gr.Dropdown(choices=["SCRFD (Default)", "YOLOv11-Face"], value="SCRFD (Default)", label="Target Face Detector Model")
-                        face_mask_type_vid = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"], value="MediaPipe FaceMesh 3D Pose (Best)", label="Face Masking/Blending Method")
+                        face_mask_type_vid = gr.Dropdown(choices=["InsightFace 106-Point", "MediaPipe FaceMesh (468-Point)"], value="MediaPipe FaceMesh (468-Point)", label="Face Masking/Blending Method")
                     
                     with gr.Group():
                         gr.Markdown("⚙️ **Hardware Device**")
@@ -922,7 +1134,7 @@ with gr.Blocks() as demo:
                         gr.Markdown("⚡ **Speed Optimization**")
                         frame_step_vid = gr.Slider(minimum=1, maximum=5, value=1, step=1, label="Frame Step / Skip (1 = Process all frames, 2 = Skip every other frame, etc.)")
                         det_size_vid = gr.Dropdown(choices=["320", "480", "640"], value="640", label="Face Detection Scan Size (Lower = Faster)")
-                        batch_size_vid = gr.Dropdown(choices=["1", "2", "4", "6", "8", "12", "16"], value="4", label="Execution Thread Count (Concurrent Threads)")
+                        batch_size_vid = gr.Dropdown(choices=["1", "2", "4", "6", "8", "12", "16", "32"], value="4", label="Execution Thread Count (Concurrent Threads)")
                         
                         gr.Markdown("🔧 **Enhancement & Realism**")
                         enhance_vid = gr.Checkbox(label="Enhance Face Details (GFPGAN)", value=False)

@@ -285,10 +285,10 @@ class SwapEngine:
         soft_mask = soft_mask * soft_mask * (3.0 - 2.0 * soft_mask)
         return np.expand_dims(soft_mask, axis=2)
 
-    def _analyze_face_mesh_3d(self, target_img, face, image_size=256):
+    def _analyze_face_mesh(self, target_img, face, image_size=256):
         """
-        Uses MediaPipe FaceMesh as a lightweight 3D face model.
-        Returns mesh points warped back to target coordinates plus an approximate head pose.
+        Uses MediaPipe FaceMesh to build a detailed face mask.
+        Returns mesh points warped back to target coordinates plus approximate pose hints.
         """
         try:
             import mediapipe as mp
@@ -391,11 +391,11 @@ class SwapEngine:
         pitch = abs(pose.get("pitch", 0.0))
         roll = abs(pose.get("roll", 0.0))
         if yaw >= 35.0:
-            return f"3D profile pose yaw={pose['yaw']:.1f}"
+            return f"profile pose yaw={pose['yaw']:.1f}"
         if pitch >= 30.0:
-            return f"3D tilted pose pitch={pose['pitch']:.1f}"
+            return f"tilted pose pitch={pose['pitch']:.1f}"
         if roll >= 35.0:
-            return f"3D rotated pose roll={pose['roll']:.1f}"
+            return f"rotated pose roll={pose['roll']:.1f}"
         return None
 
     def _build_mesh_mask(self, mask, mesh_analysis, x1, y1, log, face_index):
@@ -423,7 +423,7 @@ class SwapEngine:
         hull_pts = np.vstack([mesh_pts_local, forehead_pts])
         hull = cv2.convexHull(hull_pts.astype(np.int32))
         cv2.fillConvexPoly(mask, hull, 255)
-        log(f"[Face {face_index}] Generating MediaPipe 3D FaceMesh mask ({mesh_analysis.get('point_count', 0)} points).")
+        log(f"[Face {face_index}] Generating MediaPipe FaceMesh mask ({mesh_analysis.get('point_count', 0)} points).")
         return True
 
     def _estimate_kps_from_bbox(self, bbox):
@@ -644,8 +644,8 @@ class SwapEngine:
                 continue
 
             mesh_analysis = None
-            if face_mask_type in ("MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"):
-                mesh_analysis = self._analyze_face_mesh_3d(target_oriented, face)
+            if face_mask_type == "MediaPipe FaceMesh (468-Point)":
+                mesh_analysis = self._analyze_face_mesh(target_oriented, face)
                 mesh_note = self._mesh_pose_note(mesh_analysis)
                 if mesh_note:
                     alignment_note = mesh_note if alignment_note is None else f"{alignment_note}; {mesh_note}"
@@ -781,11 +781,11 @@ class SwapEngine:
                 # Generate dynamic landmark convex hull mask for target face
                 mask = np.zeros(swapped_face_crop.shape[:2], dtype=np.float32)
                 
-                # Option A: Google MediaPipe FaceMesh / 3D Pose mask
-                if face_mask_type in ("MediaPipe FaceMesh (468-Point)", "MediaPipe FaceMesh 3D Pose (Best)"):
+                # Option A: Google MediaPipe FaceMesh mask
+                if face_mask_type == "MediaPipe FaceMesh (468-Point)":
                     try:
                         if mesh_analysis is None:
-                            mesh_analysis = self._analyze_face_mesh_3d(target_oriented, face)
+                            mesh_analysis = self._analyze_face_mesh(target_oriented, face)
                         if not self._build_mesh_mask(mask, mesh_analysis, x1, y1, log, idx + 1):
                             raise ValueError("No mesh detected in local crop")
                     except Exception as e:
