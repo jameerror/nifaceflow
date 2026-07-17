@@ -9,7 +9,7 @@ Hardware-accelerated AI face swap studio for images and videos. Built with Pytho
 - Swap a face from a source image onto a target image.
 - Batch image swap for multiple target images at once.
 - Upload a whole target image folder from the web UI.
-- Paste a local target folder path directly, for example `C:\Users\fds\Pictures\targets`.
+- Paste a local target folder path directly, for example `C:\Users\test1234\Pictures\targets`.
 - Automatically saves batch results to an output folder.
 - Creates `swapped_batch_results.zip` for batch outputs.
 - Shows batch results in a gallery inside the web UI.
